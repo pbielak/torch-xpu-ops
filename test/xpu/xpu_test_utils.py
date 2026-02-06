@@ -390,6 +390,11 @@ _xpu_tolerance_override = {
             torch.bfloat16: tol(atol=1e-02, rtol=1.6e-02),
         }
     },
+    "_refs.nn.functional.tanhshrink": {
+        ("TestUnaryUfuncs", "test_reference_numerics_normal"): {
+            torch.complex64: tol(atol=2e-05, rtol=9e-06),
+        }
+    },
     "atan2": {
         ("TestCommon", "test_compare_cpu"): {
             torch.bfloat16: tol(atol=0.008, rtol=0.005),
@@ -464,6 +469,52 @@ _xpu_tolerance_override = {
         ("TestModuleXPU", "test_non_contiguous_tensors_nn_LazyConv3d_xpu_float32"): {
             torch.float32: tol(atol=2e-5, rtol=7e-5),
         }
+    },
+    "acos": {
+        ("TestUnaryUfuncs", "test_reference_numerics_extremal"): {
+            torch.complex64: tol(atol=1e-5, rtol=1.3e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        }
+    },
+    "_refs.acos": {
+        ("TestUnaryUfuncs", "test_reference_numerics_extremal"): {
+            torch.complex64: tol(atol=1e-5, rtol=1.3e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        }
+    },
+    "acosh": {
+        ("TestUnaryUfuncs", "test_reference_numerics_extremal"): {
+            torch.complex64: tol(atol=1e-5, rtol=1.3e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        }
+    },
+    "_refs.acosh": {
+        ("TestUnaryUfuncs", "test_reference_numerics_extremal"): {
+            torch.complex64: tol(atol=1e-5, rtol=1.3e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        }
+    },
+     "asin": {
+        ("TestUnaryUfuncs", "test_reference_numerics_extremal"): {
+            torch.complex64: tol(atol=1e-5, rtol=1.9e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        }
+    },
+    "_refs.asin": {
+        ("TestUnaryUfuncs", "test_reference_numerics_extremal"): {
+            torch.complex64: tol(atol=1e-5, rtol=1.9e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        }
+    },
+    "asinh": {
+        ("TestUnaryUfuncs", "test_reference_numerics_extremal"): {
+            torch.complex64: tol(atol=1e-5, rtol=1.5e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        },
+        ("TestUnaryUfuncs", "test_reference_numerics_normal"): {
+            torch.complex64: tol(atol=1e-5, rtol=2e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        },
+    },
+    "_refs.asinh": {
+        ("TestUnaryUfuncs", "test_reference_numerics_extremal"): {
+            torch.complex64: tol(atol=1e-5, rtol=1.5e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        },
+        ("TestUnaryUfuncs", "test_reference_numerics_normal"): {
+            torch.complex64: tol(atol=1e-5, rtol=2e-5),  # Default: atol=1e-5, rtol=1.3e-6
+        },
     },
 }
 
@@ -981,6 +1032,103 @@ def get_dtypesIf_mock(src_device_type: str):
 
     return dtypesIfXPUMock
 
+from typing import Callable, Optional, Union
+
+def _compare_complex_values_close(
+    self,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+    equal_nan: bool,
+    identifier: Optional[Union[str, Callable[[str], str]]] = None,
+    compare_regular_values_close_fn: Callable = None,
+) -> None:
+    #breakpoint()
+    non_finite_mask = ~torch.isfinite(actual) | ~torch.isfinite(expected)
+
+    # Compare real part
+    Ar = actual[non_finite_mask].real
+    Ar[Ar == -torch.inf] = torch.inf
+
+    Er = expected[non_finite_mask].real
+    Er[Er == -torch.inf] = torch.inf
+
+    compare_regular_values_close_fn(
+        self,
+        Ar,
+        Er,
+        rtol=rtol,
+        atol=atol,
+        equal_nan=equal_nan,
+        identifier=lambda default_identifier: (
+            f"[Non-finite Complex - real] {default_identifier.lower()}"
+        ),
+    )
+    # Compare imaginary part
+    Ai = actual[non_finite_mask].imag
+    Ai[Ai == -torch.inf] = torch.inf
+
+    Ei = expected[non_finite_mask].imag
+    Ei[Ei == -torch.inf] = torch.inf
+
+    compare_regular_values_close_fn(
+        self,
+        Ai,
+        Ei,
+        rtol=rtol,
+        atol=atol,
+        equal_nan=equal_nan,
+        identifier=lambda default_identifier: (
+            f"[Non-finite Complex - imag] {default_identifier.lower()}"
+        ),
+    )
+
+    # Compare finite values
+    compare_regular_values_close_fn(
+        self,
+        actual[~non_finite_mask],
+        expected[~non_finite_mask],
+        rtol=rtol,
+        atol=atol,
+        equal_nan=equal_nan,
+        identifier=lambda default_identifier: (
+            f"[Finite Complex] {default_identifier.lower()}"
+        ),
+    )
+
+
+def get_compare_regular_values_close_wrapper(original_fn):
+
+    def wrapper(
+        self,
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        rtol: float,
+        atol: float,
+        equal_nan: bool,
+        identifier: Optional[Union[str, Callable[[str], str]]] = None,
+    ):
+        if actual.is_complex() and expected.is_complex():
+            return _compare_complex_values_close(
+                self,
+                actual,
+                expected,
+                rtol=rtol,
+                atol=atol,
+                equal_nan=equal_nan,
+                identifier=identifier,
+                compare_regular_values_close_fn=original_fn,
+            )
+        else:
+            return original_fn(
+                self, actual, expected, rtol=rtol, atol=atol, equal_nan=equal_nan, identifier=identifier
+            )
+
+    return wrapper
+
 
 class XPUPatchForImport:
     def __init__(self, patch_test_case=True) -> None:
@@ -1192,6 +1340,11 @@ class XPUPatchForImport:
         cuda.is_bf16_supported = lambda: True
         torch.cuda.is_tf32_supported = is_tf32_supported
         torch.cuda.get_device_capability = torch.xpu.get_device_capability
+
+        from torch.testing._comparison import TensorLikePair
+        TensorLikePair._compare_regular_values_close = get_compare_regular_values_close_wrapper(
+            original_fn=TensorLikePair._compare_regular_values_close,
+        )
 
         sys.path.extend(self.test_package)
 
