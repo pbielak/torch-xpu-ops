@@ -345,6 +345,7 @@ _ops_dtype_different_cuda_support = {
 
 _cuda_xfail_xpu_pass = [
     ("rsqrt", "test_reference_numerics_large"),
+    ("_refs.rsqrt", "test_reference_numerics_large"),
     ("_batch_norm_with_update", "test_noncontiguous_samples"),
     ("_batch_norm_with_update", "test_dispatch_symbolic_meta_outplace_all_strides"),
     ("histc", "test_out"),
@@ -1032,6 +1033,15 @@ class XPUPatchForImport:
                         else:
                             wrapper.device_type = "xpu"
                             replaced = True
+
+                    if (
+                        wrapper.device_type is None
+                        and unittest.expectedFailure in wrapper.decorators
+                        and (op_name, wrapper.test_name) in _cuda_xfail_xpu_pass
+                    ):
+                        replaced = True
+                        continue  # remove expectedFailure if it applies to all devices but passes on XPU
+
                     wrapper_xpu.append(wrapper)
                 elif self.only_cuda_fn == wrapper:
                     wrapper_xpu.append(common_device_type.onlyCUDA)
