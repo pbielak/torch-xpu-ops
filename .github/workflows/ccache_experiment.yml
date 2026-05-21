@@ -1,0 +1,262 @@
+name: ccache experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_baseline:
+        description: 'Also run a baseline build without ccache'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash -xe {0}
+
+jobs:
+  build-with-ccache:
+    name: Build with ccache
+    runs-on: build
+    container:
+      image: 'pytorch/manylinux2_28-builder:xpu-main'
+      volumes:
+        - ${{ github.workspace }}:${{ github.workspace }}
+      env:
+        PATH: /tmp/xpu-tool/myvenv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        AGENT_TOOLSDIRECTORY: /tmp/xpu-tool
+        PIP_CACHE_DIR: /tmp/xpu-tool/.pipcache
+        CCACHE_DIR: ${{ github.workspace }}/.ccache
+        CCACHE_MAXSIZE: 10G
+        CCACHE_COMPRESS: 'true'
+        CCACHE_COMPRESSLEVEL: '6'
+    env:
+      GH_TOKEN: ${{ github.token }}
+    timeout-minutes: 300
+    steps:
+      - name: Install gh-cli
+        run: |
+          cat /etc/os-release
+          hostname && id
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh --repo gh-cli
+          gh --version
+          rm -rf ${{ github.workspace }}/*.whl ${{ github.workspace }}/*.log
+
+      - name: Setup python-3.10
+        run: |
+          rm -rf /tmp/xpu-tool/myvenv
+          /opt/python/cp310-cp310/bin/python -m venv /tmp/xpu-tool/myvenv
+          which python && python -V
+          which pip && pip list
+          pip install -U pip wheel setuptools==81.0.0
+
+      - name: Checkout torch-xpu-ops
+        uses: actions/checkout@v4
+        with:
+          path: torch-xpu-ops
+
+      # ── ccache: restore ────────────────────────────────────────────
+      - name: Restore ccache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-linux-xpu-build
+          restore-keys: |
+            ccache-linux-xpu-
+
+      - name: Install and configure ccache
+        run: |
+          dnf install -y ccache
+          ccache --version
+          ccache --zero-stats
+          ccache -p
+          echo "CCACHE_DIR=${CCACHE_DIR}"
+          du -sh "${CCACHE_DIR}" 2>/dev/null || echo "ccache dir empty/missing (cold cache)"
+
+      # ── Build ──────────────────────────────────────────────────────
+      - name: Build PyTorch (with ccache)
+        run: |
+          export USE_XCCL=1
+          export IS_XPU_CI=1
+          export TORCH_XPU_ARCH_LIST='pvc'
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          export MAX_JOBS=8
+
+          # gcc 13
+          source /opt/rh/gcc-toolset-13/enable
+          source ${{ github.workspace }}/torch-xpu-ops/.github/scripts/env.sh
+
+          BUILD_START=$(date +%s)
+
+          ${{ github.workspace }}/torch-xpu-ops/.github/scripts/build.sh \
+            --WORKSPACE="${{ github.workspace }}" \
+            --PYTORCH_REPO="https://github.com/pytorch/pytorch.git" \
+            --PYTORCH_COMMIT="main" \
+            --TORCH_XPU_OPS_REPO="https://github.com/${{ github.repository }}.git" \
+            --TORCH_XPU_OPS_COMMIT="${{ github.sha }}" \
+            2>&1 | tee ${{ github.workspace }}/build_pytorch.log
+
+          BUILD_END=$(date +%s)
+          BUILD_DURATION=$((BUILD_END - BUILD_START))
+          echo "BUILD_DURATION=${BUILD_DURATION}" >> $GITHUB_ENV
+          echo "::notice::PyTorch build took ${BUILD_DURATION} seconds"
+
+          if [ $(ls ${{ github.workspace }} | grep -c "torch-.*.whl") -eq 0 ]; then
+            echo "Build pytorch got failed"
+            exit 1
+          fi
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        run: |
+          ccache -s
+          echo "CCACHE_SIZE=$(du -sh ${CCACHE_DIR} 2>/dev/null | cut -f1)" >> $GITHUB_ENV
+
+      # ── ccache: save ───────────────────────────────────────────────
+      - name: Delete old ccache entry
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache delete ccache-linux-xpu-build --repo ${{ github.repository }} || true
+
+      - name: Save ccache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-linux-xpu-build
+
+      # ── Results ────────────────────────────────────────────────────
+      - name: Upload Build Log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccache-experiment-build-log
+          path: ${{ github.workspace }}/build_pytorch.log
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          echo "## ccache Experiment Results"          >> $GITHUB_STEP_SUMMARY
+          echo ""                                      >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |"                    >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|"                    >> $GITHUB_STEP_SUMMARY
+          echo "| Build duration | ${BUILD_DURATION}s |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cache hit | ${{ steps.cache-restore.outputs.cache-hit }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cache size | ${CCACHE_SIZE:-N/A} |"  >> $GITHUB_STEP_SUMMARY
+          echo ""                                      >> $GITHUB_STEP_SUMMARY
+          echo "### ccache stats"                      >> $GITHUB_STEP_SUMMARY
+          echo '```'                                   >> $GITHUB_STEP_SUMMARY
+          ccache -s                                    >> $GITHUB_STEP_SUMMARY
+          echo '```'                                   >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Torch XPU Wheel
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Torch-XPU-Wheel-ccache-experiment
+          path: ${{ github.workspace }}/*.whl
+
+      - name: Cleanup workspace
+        if: ${{ always() }}
+        run: |
+          chmod 777 /__w /github ./ -R 2>/dev/null || true
+
+  # ── Baseline: build without ccache ───────────────────────────────
+  build-without-ccache:
+    name: Build without ccache (baseline)
+    if: ${{ inputs.run_baseline }}
+    runs-on: build
+    container:
+      image: 'pytorch/manylinux2_28-builder:xpu-main'
+      volumes:
+        - ${{ github.workspace }}:${{ github.workspace }}
+      env:
+        PATH: /tmp/xpu-tool/myvenv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        AGENT_TOOLSDIRECTORY: /tmp/xpu-tool
+        PIP_CACHE_DIR: /tmp/xpu-tool/.pipcache
+    env:
+      GH_TOKEN: ${{ github.token }}
+    timeout-minutes: 300
+    steps:
+      - name: Install gh-cli
+        run: |
+          cat /etc/os-release
+          hostname && id
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh --repo gh-cli
+          gh --version
+          rm -rf ${{ github.workspace }}/*.whl ${{ github.workspace }}/*.log
+
+      - name: Setup python-3.10
+        run: |
+          rm -rf /tmp/xpu-tool/myvenv
+          /opt/python/cp310-cp310/bin/python -m venv /tmp/xpu-tool/myvenv
+          which python && python -V
+          which pip && pip list
+          pip install -U pip wheel setuptools==81.0.0
+
+      - name: Checkout torch-xpu-ops
+        uses: actions/checkout@v4
+        with:
+          path: torch-xpu-ops
+
+      - name: Build PyTorch (no ccache — baseline)
+        run: |
+          export USE_XCCL=1
+          export IS_XPU_CI=1
+          export TORCH_XPU_ARCH_LIST='pvc'
+          export MAX_JOBS=8
+
+          source /opt/rh/gcc-toolset-13/enable
+          source ${{ github.workspace }}/torch-xpu-ops/.github/scripts/env.sh
+
+          BUILD_START=$(date +%s)
+
+          ${{ github.workspace }}/torch-xpu-ops/.github/scripts/build.sh \
+            --WORKSPACE="${{ github.workspace }}" \
+            --PYTORCH_REPO="https://github.com/pytorch/pytorch.git" \
+            --PYTORCH_COMMIT="main" \
+            --TORCH_XPU_OPS_REPO="https://github.com/${{ github.repository }}.git" \
+            --TORCH_XPU_OPS_COMMIT="${{ github.sha }}" \
+            2>&1 | tee ${{ github.workspace }}/build_pytorch_baseline.log
+
+          BUILD_END=$(date +%s)
+          BUILD_DURATION=$((BUILD_END - BUILD_START))
+          echo "BUILD_DURATION=${BUILD_DURATION}" >> $GITHUB_ENV
+          echo "::notice::Baseline build took ${BUILD_DURATION} seconds"
+
+          if [ $(ls ${{ github.workspace }} | grep -c "torch-.*.whl") -eq 0 ]; then
+            echo "Build pytorch got failed"
+            exit 1
+          fi
+
+      - name: Upload Build Log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-build-log
+          path: ${{ github.workspace }}/build_pytorch_baseline.log
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          echo "## Baseline Build (no ccache)"         >> $GITHUB_STEP_SUMMARY
+          echo ""                                      >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |"                    >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|"                    >> $GITHUB_STEP_SUMMARY
+          echo "| Build duration | ${BUILD_DURATION}s |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup workspace
+        if: ${{ always() }}
+        run: |
+          chmod 777 /__w /github ./ -R 2>/dev/null || true
